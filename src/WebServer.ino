@@ -6,6 +6,7 @@
 #define ONLY_IP_RANGE_ALLOWED  2
 #define _HEAD false
 #define _TAIL true
+#define CHUNKED_BUFFER_SIZE          400
 
 void sendContentBlocking(String& data);
 void sendHeaderBlocking(bool json);
@@ -21,58 +22,72 @@ public:
   uint32_t finalRam;
   uint32_t maxCoreUsage;
   uint32_t maxServerUsage;
-  unsigned int BufferSize;
   unsigned int sentBytes;
   String buf;
 
   StreamingBuffer(void) : lowMemorySkip(false),
     initialRam(0), beforeTXRam(0), duringTXRam(0), finalRam(0), maxCoreUsage(0),
-    maxServerUsage(0), BufferSize(400), sentBytes(0)
+    maxServerUsage(0), sentBytes(0)
   {
-    buf.reserve(BufferSize + 100);
+    buf.reserve(CHUNKED_BUFFER_SIZE + 50);
     buf = "";
   }
-  StreamingBuffer operator= (String& a)                 { this->buf=a;           checkFull();  return *this;  }
-  StreamingBuffer operator= (const String& a)           { this->buf=a;           checkFull();  return *this;  }
-  StreamingBuffer operator+= (long unsigned int  a)     { this->buf+=String(a);  checkFull();  return *this;  }
-  StreamingBuffer operator+= (float a)                  { this->buf+=String(a);  checkFull();  return *this;  }
-  StreamingBuffer operator+= (int a)                    { this->buf+=String(a);  checkFull();  return *this;  }
-  StreamingBuffer operator+= (uint32_t a)               { this->buf+=String(a);  checkFull();  return *this;  }
-  StreamingBuffer operator+=(const String& a) {
+  StreamingBuffer operator= (String& a)                 { flush(); return addString(a); }
+  StreamingBuffer operator= (const String& a)           { flush(); return addString(a); }
+  StreamingBuffer operator+= (long unsigned int  a)     { return addString(String(a)); }
+  StreamingBuffer operator+= (float a)                  { return addString(String(a)); }
+  StreamingBuffer operator+= (int a)                    { return addString(String(a)); }
+  StreamingBuffer operator+= (uint32_t a)               { return addString(String(a)); }
+  StreamingBuffer operator+=(const String& a)           { return addString(a); }
+
+  StreamingBuffer addString(const String& a) {
     if (lowMemorySkip) return *this;
-    const int length = a.length();
-    if (((this->buf.length() + length) > BufferSize) &&
-        (this->buf.length() > 100))
-      sendContentBlocking(this->buf);
+    int flush_step = CHUNKED_BUFFER_SIZE - this->buf.length();
+    if (flush_step < 1) flush_step = 0;
     int pos = 0;
-    int flush_step = BufferSize - this->buf.length();
-    if (flush_step < 1) flush_step = 1;
+    const int length = a.length();
     while (pos < length) {
-      const char c = a[pos];
-      this->buf += c;
-      ++pos;
-      --flush_step;
       if (flush_step == 0) {
         sendContentBlocking(this->buf);
-        flush_step = BufferSize;
+        flush_step = CHUNKED_BUFFER_SIZE;
       }
+      this->buf += a[pos];
+      ++pos;
+      --flush_step;
     }
     checkFull();
     return *this;
   }
 
+  void flush() {
+    if (lowMemorySkip) {
+      this->buf = "";
+    } else {
+      sendContentBlocking(this->buf);
+    }
+  }
+
   void checkFull(void) {
     if (lowMemorySkip) this->buf = "";
-    if (this->buf.length() > BufferSize) {
+    if (this->buf.length() > CHUNKED_BUFFER_SIZE) {
       trackTotalMem();
       sendContentBlocking(this->buf);
     }
   }
 
   void startStream() {
+    startStream(false);
+  }
+
+  void startJsonStream() {
+    startStream(true);
+  }
+
+private:
+  void startStream(bool json) {
     maxCoreUsage = maxServerUsage = 0;
-    beforeTXRam = ESP.getFreeHeap();
     initialRam = ESP.getFreeHeap();
+    beforeTXRam = initialRam;
     sentBytes = 0;
     buf = "";
     if (beforeTXRam < 3000) {
@@ -83,7 +98,7 @@ public:
        #endif
       return;
     } else
-      sendHeaderBlocking();
+      sendHeaderBlocking(json);
   }
 
   void trackTotalMem() {
@@ -91,6 +106,8 @@ public:
     if ((initialRam - beforeTXRam) > maxServerUsage)
       maxServerUsage = initialRam - beforeTXRam;
   }
+
+public:
 
   void trackCoreMem() {
     duringTXRam = ESP.getFreeHeap();
@@ -118,17 +135,18 @@ public:
 void sendContentBlocking(String& data) {
   checkRAM(F("sendContentBlocking"));
   uint32_t freeBeforeSend = ESP.getFreeHeap();
-  String log = String("sendcontent free: ") + freeBeforeSend + " chunk size:" + data.length();
+  const uint32_t length = data.length();
+  String log = String("sendcontent free: ") + freeBeforeSend + " chunk size:" + length;
   addLog(LOG_LEVEL_DEBUG_DEV, log);
   freeBeforeSend = ESP.getFreeHeap();
   if (TXBuffer.beforeTXRam > freeBeforeSend)
     TXBuffer.beforeTXRam = freeBeforeSend;
   TXBuffer.duringTXRam = freeBeforeSend;
 #if defined(ESP8266) && defined(ARDUINO_ESP8266_RELEASE_2_3_0)
-  String size = String(data.length(), HEX) + "\r\n";
+  String size = String(length, HEX) + "\r\n";
   // do chunked transfer encoding ourselves (WebServer doesn't support it)
   WebServer.sendContent(size);
-  if (data.length()) WebServer.sendContent(data);
+  if (length > 0) WebServer.sendContent(data);
   WebServer.sendContent("\r\n");
 #else  // ESP8266 2.4.0rc2 and higher and the ESP32 webserver supports chunked http transfer
   unsigned int timeout = 0;
@@ -147,18 +165,18 @@ void sendContentBlocking(String& data) {
   }
 #endif
 
-  TXBuffer.sentBytes += data.length();
+  TXBuffer.sentBytes += length;
   data = "";
 }
 
-void sendHeaderBlocking() {
+void sendHeaderBlocking(bool json) {
   checkRAM(F("sendHeaderBlocking"));
 #if defined(ESP8266) && defined(ARDUINO_ESP8266_RELEASE_2_3_0)
   WebServer.setContentLength(CONTENT_LENGTH_UNKNOWN);
-  WebServer.sendHeader("Content-Type", "text/html", true);
-  WebServer.sendHeader("Accept-Ranges", "none");
-  WebServer.sendHeader("Cache-Control", "no-cache");
-  WebServer.sendHeader("Transfer-Encoding", "chunked");
+  WebServer.sendHeader(F("Content-Type"), json ? F("application/json") : F("text/html"), true);
+  WebServer.sendHeader(F("Accept-Ranges"), F("none"));
+  WebServer.sendHeader(F("Cache-Control"), F("no-cache"));
+  WebServer.sendHeader(F("Transfer-Encoding"), F("chunked"));
   WebServer.send(200);
 #else
   unsigned int timeout = 0;
@@ -167,8 +185,8 @@ void sendHeaderBlocking() {
   if (freeBeforeSend < 4000) timeout = 1000;
   const uint32_t beginWait = millis();
   WebServer.setContentLength(CONTENT_LENGTH_UNKNOWN);
-  WebServer.sendHeader("Content-Type", "text/html", true);
-  WebServer.sendHeader("Cache-Control", "no-cache");
+  WebServer.sendHeader(F("Content-Type"), json ? F("application/json") : F("text/html"), true);
+  WebServer.sendHeader(F("Cache-Control"), F("no-cache"));
   WebServer.send(200);
   // dont wait on 2.3.0. Memory returns just too slow.
   while ((ESP.getFreeHeap() < freeBeforeSend) &&
@@ -349,7 +367,7 @@ void clearAccessBlock()
 //********************************************************************************
 // Web Interface init
 //********************************************************************************
-#include "core_version.h"
+//#include "core_version.h"
 #define HTML_SYMBOL_WARNING "&#9888;"
 
 #if defined(ESP8266)
@@ -380,6 +398,7 @@ static const char pgDefaultCSS[] PROGMEM = {
     ".note {color: #444; font-style: italic; }"
     //header with title and menu
     ".headermenu {position: fixed; top: 0; left: 0; right: 0; height: 90px; padding: 8px 12px; background-color: #F8F8F8; border-bottom: 1px solid #DDD; }"
+    ".apheader {padding: 8px 12px; background-color: #F8F8F8;}"
     ".bodymenu {margin-top: 96px; }"
     // menu
     ".menubar {position: inherit; top: 55px; }"
@@ -494,11 +513,13 @@ void getWebPageTemplateDefault(const String& tmplName, String& tmpl)
               "{{css}}"
               "</head>"
               "<body>"
-              "<header class='headermenu'>"
+              "<header class='apheader'>"
               "<h1>Welcome to ESP Easy Mega AP</h1>"
               "</header>"
               "<section>"
+              "<span class='message error'>"
               "{{error}}"
+              "</span>"
               "{{content}}"
               "</section>"
               "<footer>"
@@ -521,7 +542,9 @@ void getWebPageTemplateDefault(const String& tmplName, String& tmpl)
               "<h1>ESP Easy Mega: {{name}}</h1>"
               "</header>"
               "<section>"
+              "<span class='message error'>"
               "{{error}}"
+              "</span>"
               "{{content}}"
               "</section>"
               "<footer>"
@@ -658,13 +681,15 @@ void getWebPageTemplateVar(const String& varName )
       // Send CSS per chunk to avoid sending either too short or too large strings.
       String tmpString;
       tmpString.reserve(64);
+      uint16_t tmpStringPos = 0;
       for (unsigned int i = 0; i < strlen(pgDefaultCSS); i++)
       {
-        const char c = (char)pgm_read_byte(&pgDefaultCSS[i]);
-        tmpString += c;
-        if (c == ';' || c == '{') {
+        tmpString += (char)pgm_read_byte(&pgDefaultCSS[i]);
+        ++tmpStringPos;
+        if (tmpStringPos == 64) {
           TXBuffer += tmpString;
           tmpString = "";
+          tmpStringPos = 0;
         }
       } // saves 1k of ram
       if (tmpString.length() > 0) {
@@ -1186,6 +1211,7 @@ void handle_controllers() {
         copyFormPassword(F("controllerpassword"), SecuritySettings.ControllerPassword[controllerindex], sizeof(SecuritySettings.ControllerPassword[0]));
         strncpy(ControllerSettings.Subscribe, controllersubscribe.c_str(), sizeof(ControllerSettings.Subscribe));
         strncpy(ControllerSettings.Publish, controllerpublish.c_str(), sizeof(ControllerSettings.Publish));
+        CPlugin_ptr[ProtocolIndex](CPLUGIN_INIT, &TempEvent, dummyString);
       }
     }
     addHtmlError( TXBuffer.buf, SaveControllerSettings(controllerindex, (byte*)&ControllerSettings, sizeof(ControllerSettings)));
@@ -1264,56 +1290,60 @@ void handle_controllers() {
       options[0] = F("Use IP address");
       options[1] = F("Use Hostname");
 
-      addFormSelector(TXBuffer.buf,  F("Locate Controller"), F("usedns"), 2, options, NULL, NULL, choice, true);
-
-      if (ControllerSettings.UseDNS)
-      {
-        addFormTextBox(TXBuffer.buf,  F("Controller Hostname"), F("controllerhostname"), ControllerSettings.HostName, sizeof(ControllerSettings.HostName)-1);
-      }
-      else
-      {
-        addFormIPBox(TXBuffer.buf,  F("Controller IP"), F("controllerip"), ControllerSettings.IP);
-      }
-
-      addFormNumericBox(TXBuffer.buf,  F("Controller Port"), F("controllerport"), ControllerSettings.Port, 1, 65535);
-
       byte ProtocolIndex = getProtocolIndex(Settings.Protocol[controllerindex]);
-      if (Protocol[ProtocolIndex].usesAccount)
-      {
-         String protoDisplayName;
-        if (!getControllerProtocolDisplayName(ProtocolIndex, CONTROLLER_USER, protoDisplayName)) {
-          protoDisplayName = F("Controller User");
+      if (!Protocol[ProtocolIndex].Custom){
+
+        addFormSelector(TXBuffer.buf,  F("Locate Controller"), F("usedns"), 2, options, NULL, NULL, choice, true);
+
+        if (ControllerSettings.UseDNS)
+        {
+          addFormTextBox(TXBuffer.buf,  F("Controller Hostname"), F("controllerhostname"), ControllerSettings.HostName, sizeof(ControllerSettings.HostName)-1);
         }
-        addFormTextBox(TXBuffer.buf, protoDisplayName, F("controlleruser"), SecuritySettings.ControllerUser[controllerindex], sizeof(SecuritySettings.ControllerUser[0])-1);
-       }
-      if (Protocol[ProtocolIndex].usesPassword)
-      {
-        String protoDisplayName;
-        if (getControllerProtocolDisplayName(ProtocolIndex, CONTROLLER_PASS, protoDisplayName)) {
-          // It is not a regular password, thus use normal text field.
-          addFormTextBox(TXBuffer.buf, protoDisplayName, F("controllerpassword"), SecuritySettings.ControllerPassword[controllerindex], sizeof(SecuritySettings.ControllerPassword[0])-1);
-        } else {
-          addFormPasswordBox(TXBuffer.buf, F("Controller Password"), F("controllerpassword"), SecuritySettings.ControllerPassword[controllerindex], sizeof(SecuritySettings.ControllerPassword[0])-1);
+        else
+        {
+          addFormIPBox(TXBuffer.buf,  F("Controller IP"), F("controllerip"), ControllerSettings.IP);
         }
+
+        addFormNumericBox(TXBuffer.buf,  F("Controller Port"), F("controllerport"), ControllerSettings.Port, 1, 65535);
+
+        if (Protocol[ProtocolIndex].usesAccount)
+        {
+           String protoDisplayName;
+          if (!getControllerProtocolDisplayName(ProtocolIndex, CONTROLLER_USER, protoDisplayName)) {
+            protoDisplayName = F("Controller User");
+          }
+          addFormTextBox(TXBuffer.buf, protoDisplayName, F("controlleruser"), SecuritySettings.ControllerUser[controllerindex], sizeof(SecuritySettings.ControllerUser[0])-1);
+         }
+        if (Protocol[ProtocolIndex].usesPassword)
+        {
+          String protoDisplayName;
+          if (getControllerProtocolDisplayName(ProtocolIndex, CONTROLLER_PASS, protoDisplayName)) {
+            // It is not a regular password, thus use normal text field.
+            addFormTextBox(TXBuffer.buf, protoDisplayName, F("controllerpassword"), SecuritySettings.ControllerPassword[controllerindex], sizeof(SecuritySettings.ControllerPassword[0])-1);
+          } else {
+            addFormPasswordBox(TXBuffer.buf, F("Controller Password"), F("controllerpassword"), SecuritySettings.ControllerPassword[controllerindex], sizeof(SecuritySettings.ControllerPassword[0])-1);
+          }
+        }
+
+        if (Protocol[ProtocolIndex].usesTemplate || Protocol[ProtocolIndex].usesMQTT)
+        {
+           String protoDisplayName;
+          if (!getControllerProtocolDisplayName(ProtocolIndex, CONTROLLER_SUBSCRIBE, protoDisplayName)) {
+            protoDisplayName = F("Controller Subscribe");
+          }
+          addFormTextBox(TXBuffer.buf, protoDisplayName, F("controllersubscribe"), ControllerSettings.Subscribe, sizeof(ControllerSettings.Subscribe)-1);
+         }
+
+        if (Protocol[ProtocolIndex].usesTemplate || Protocol[ProtocolIndex].usesMQTT)
+        {
+           String protoDisplayName;
+          if (!getControllerProtocolDisplayName(ProtocolIndex, CONTROLLER_PUBLISH, protoDisplayName)) {
+            protoDisplayName = F("Controller Publish");
+          }
+          addFormTextBox(TXBuffer.buf, protoDisplayName, F("controllerpublish"), ControllerSettings.Publish, sizeof(ControllerSettings.Publish)-1);
+         }
+
       }
-
-      if (Protocol[ProtocolIndex].usesTemplate || Protocol[ProtocolIndex].usesMQTT)
-      {
-         String protoDisplayName;
-        if (!getControllerProtocolDisplayName(ProtocolIndex, CONTROLLER_SUBSCRIBE, protoDisplayName)) {
-          protoDisplayName = F("Controller Subscribe");
-        }
-        addFormTextBox(TXBuffer.buf, protoDisplayName, F("controllersubscribe"), ControllerSettings.Subscribe, sizeof(ControllerSettings.Subscribe)-1);
-       }
-
-      if (Protocol[ProtocolIndex].usesTemplate || Protocol[ProtocolIndex].usesMQTT)
-      {
-         String protoDisplayName;
-        if (!getControllerProtocolDisplayName(ProtocolIndex, CONTROLLER_PUBLISH, protoDisplayName)) {
-          protoDisplayName = F("Controller Publish");
-        }
-        addFormTextBox(TXBuffer.buf, protoDisplayName, F("controllerpublish"), ControllerSettings.Publish, sizeof(ControllerSettings.Publish)-1);
-       }
 
       addFormCheckBox(TXBuffer.buf,  F("Enabled"), F("controllerenabled"), Settings.ControllerEnabled[controllerindex]);
 
@@ -1825,18 +1855,6 @@ void handle_devices() {
       if (Device[DeviceIndex].InverseLogicOption)
         Settings.TaskDevicePin1Inversed[taskIndex] = (WebServer.arg(F("TDPI")) == F("on"));
 
-      if (Settings.GlobalSync)
-      {
-        if (Device[DeviceIndex].GlobalSyncOption)
-          Settings.TaskDeviceGlobalSync[taskIndex] = (WebServer.arg(F("TDGS")) == F("on"));
-
-        // Send task info if set global
-        if (Settings.TaskDeviceGlobalSync[taskIndex])
-        {
-          SendUDPTaskInfo(0, taskIndex, taskIndex);
-        }
-      }
-
       for (byte varNr = 0; varNr < Device[DeviceIndex].ValueCount; varNr++)
       {
 
@@ -1864,6 +1882,18 @@ void handle_devices() {
 
       //allow the plugin to save plugin-specific form settings.
       PluginCall(PLUGIN_WEBFORM_SAVE, &TempEvent, dummyString);
+
+      // notify controllers: CPLUGIN_TASK_CHANGE_NOTIFICATION
+      for (byte x=0; x < CONTROLLER_MAX; x++)
+        {
+          TempEvent.ControllerIndex = x;
+          if (Settings.TaskDeviceSendData[TempEvent.ControllerIndex][TempEvent.TaskIndex] &&
+            Settings.ControllerEnabled[TempEvent.ControllerIndex] && Settings.Protocol[TempEvent.ControllerIndex])
+            {
+              TempEvent.ProtocolIndex = getProtocolIndex(Settings.Protocol[TempEvent.ControllerIndex]);
+              CPlugin_ptr[TempEvent.ProtocolIndex](CPLUGIN_TASK_CHANGE_NOTIFICATION, &TempEvent, dummyString);
+            }
+        }
     }
     addHtmlError(  SaveTaskSettings(taskIndex));
 
@@ -2061,11 +2091,6 @@ void handle_devices() {
       addFormTextBox(TXBuffer.buf,  F("Name"), F("TDN"), ExtraTaskSettings.TaskDeviceName, 40);   //="taskdevicename"
 
       addFormCheckBox(TXBuffer.buf,  F("Enabled"), F("TDE"), Settings.TaskDeviceEnabled[taskIndex]);   //="taskdeviceenabled"
-
-      if (Settings.GlobalSync && Device[DeviceIndex].GlobalSyncOption && Settings.TaskDeviceDataFeed[taskIndex] == 0 && Settings.UDPPort != 0)
-      {
-        addFormCheckBox(TXBuffer.buf,  F("Global Sync"), F("TDGS"), Settings.TaskDeviceGlobalSync[taskIndex]);   //="taskdeviceglobalsync"
-      }
 
       // section: Sensor / Actuator
       if (!Device[DeviceIndex].Custom && Settings.TaskDeviceDataFeed[taskIndex] == 0 &&
@@ -3417,8 +3442,7 @@ void handle_control() {
   checkRAM(F("handle_control"));
   if (!clientIPallowed()) return;
   //TXBuffer.startStream(true); // true= json
- // sendHeadandTail(F("TmplStd"),_HEAD);
-
+  // sendHeadandTail(F("TmplStd"),_HEAD);
   String webrequest = WebServer.arg(F("cmd"));
 
   // in case of event, store to buffer and return...
@@ -3437,18 +3461,18 @@ void handle_control() {
   printToWeb = true;
   printWebString = "";
 
+  if (printToWebJSON)
+    TXBuffer.startJsonStream();
+  else
+    TXBuffer.startStream();
 
   if (PluginCall(PLUGIN_WRITE, &TempEvent, webrequest));
   else if (remoteConfig(&TempEvent, webrequest));
   else
     TXBuffer += F("Unknown or restricted command!");
 
-  TXBuffer +=  printWebString;
-
-  if (printToWebJSON)
-    WebServer.send(200, "application/json");
-  else
-    WebServer.send(200, "text/html");
+  TXBuffer += printWebString;
+  TXBuffer.endStream();
 
   printWebString = "";
   printToWeb = false;
@@ -3572,7 +3596,6 @@ void handle_advanced() {
   String usessdp = WebServer.arg(F("usessdp"));
   String edit = WebServer.arg(F("edit"));
   String wireclockstretchlimit = WebServer.arg(F("wireclockstretchlimit"));
-  String globalsync = WebServer.arg(F("globalsync"));
   String userules = WebServer.arg(F("userules"));
   String cft = WebServer.arg(F("cft"));
   String MQTTRetainFlag = WebServer.arg(F("mqttretainflag"));
@@ -3606,7 +3629,6 @@ void handle_advanced() {
     Settings.UseSSDP = (usessdp == "on");
     Settings.WireClockStretchLimit = wireclockstretchlimit.toInt();
     Settings.UseRules = (userules == "on");
-    Settings.GlobalSync = (globalsync == "on");
     Settings.ConnectionFailuresThreshold = cft.toInt();
     Settings.MQTTRetainFlag = (MQTTRetainFlag == "on");
     Settings.ArduinoOTAEnable = (ArduinoOTAEnable == "on");
@@ -3662,9 +3684,8 @@ void handle_advanced() {
   addFormNumericBox(TXBuffer.buf,  F("Baud Rate"), F("baudrate"), Settings.BaudRate, 0, 1000000);
 
 
-  addFormSubHeader(TXBuffer.buf,  F("Inter-ESPEasy Network (experimental)"));
+  addFormSubHeader(TXBuffer.buf,  F("Inter-ESPEasy Network"));
 
-  addFormCheckBox( TXBuffer.buf, F("Global Sync"), F("globalsync"), Settings.GlobalSync);
   addFormNumericBox(TXBuffer.buf,  F("UDP port"), F("udpport"), Settings.UDPPort, 0, 65535);
 
 
@@ -4143,7 +4164,7 @@ void handle_filelist() {
   if (fdelete.length() > 0)
   {
     SPIFFS.remove(fdelete);
-    // flashCount();
+    checkRuleSets();
   }
 
 
@@ -4617,6 +4638,7 @@ void handle_rules() {
 
    TXBuffer += F("<TR><TD>Edit: ");
   addSelector(TXBuffer.buf,  F("set"), RULESETS_MAX, options, optionValues, NULL, choice, true);
+  addButton(TXBuffer.buf, fileName, F("Download to file"));
   addHelpButton(TXBuffer.buf,  F("Tutorial_Rules"));
 
   // load form data from flash
@@ -4656,6 +4678,7 @@ void handle_rules() {
   sendHeadandTail(F("TmplStd"),true);
   TXBuffer.endStream();
 
+  checkRuleSets();
 }
 
 

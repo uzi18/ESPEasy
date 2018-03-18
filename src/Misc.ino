@@ -27,8 +27,6 @@ bool isDeepSleepEnabled()
 {
   if (!Settings.deepSleep)
     return false;
-  if (!timeOutReached(timerAwakeFromDeepSleep + 1000 * Settings.deepSleep))
-    return false;
 
   //cancel deep sleep loop by pulling the pin GPIO16(D0) to GND
   //recommended wiring: 3-pin-header with 1=RST, 2=D0, 3=GND
@@ -40,6 +38,13 @@ bool isDeepSleepEnabled()
     return false;
   }
   return true;
+}
+
+bool readyForSleep()
+{
+  if (!isDeepSleepEnabled())
+    return false;
+  return timeOutReached(timerAwakeFromDeepSleep + 1000 * Settings.deepSleep);
 }
 
 void deepSleep(int delay)
@@ -973,22 +978,11 @@ String ClearInFile(char* fname, int index, int datasize)
 String LoadFromFile(char* fname, int index, byte* memAddress, int datasize)
 {
   checkRAM(F("LoadFromFile"));
-  // addLog(LOG_LEVEL_INFO, String(F("FILE : Load size "))+datasize);
 
   fs::File f = SPIFFS.open(fname, "r+");
   SPIFFS_CHECK(f, fname);
-
-  // addLog(LOG_LEVEL_INFO, String(F("FILE : File size "))+f.size());
-
   SPIFFS_CHECK(f.seek(index, fs::SeekSet), fname);
-  byte *pointerToByteToRead = memAddress;
-  for (int x = 0; x < datasize; x++)
-  {
-    int readres=f.read();
-    SPIFFS_CHECK(readres >=0, fname);
-    *pointerToByteToRead = readres;
-    pointerToByteToRead++;// next byte
-  }
+  SPIFFS_CHECK(f.read(memAddress,datasize), fname);
   f.close();
 
   return(String());
@@ -1896,6 +1890,29 @@ int Calculate(const char *input, float* result)
 }
 
 
+void checkRuleSets(){
+for (byte x=0; x < RULESETS_MAX; x++){
+  #if defined(ESP8266)
+    String fileName = F("rules");
+  #endif
+  #if defined(ESP32)
+    String fileName = F("/rules");
+  #endif
+  fileName += x+1;
+  fileName += F(".txt");
+  if (SPIFFS.exists(fileName))
+    activeRuleSets[x] = true;
+  else
+    activeRuleSets[x] = false;
+
+  if (Settings.SerialLogLevel == LOG_LEVEL_DEBUG_DEV){
+    Serial.print(fileName);
+    Serial.print(" ");
+    Serial.println(activeRuleSets[x]);
+    }
+  }
+}
+
 
 /********************************************************************************************\
   Rules processing
@@ -1910,7 +1927,7 @@ void rulesProcessing(String& event)
   log += event;
   addLog(LOG_LEVEL_INFO, log);
 
-  for (byte x = 1; x < RULESETS_MAX + 1; x++)
+  for (byte x = 0; x < RULESETS_MAX; x++)
   {
     #if defined(ESP8266)
       String fileName = F("rules");
@@ -1918,9 +1935,9 @@ void rulesProcessing(String& event)
     #if defined(ESP32)
       String fileName = F("/rules");
     #endif
-    fileName += x;
+    fileName += x+1;
     fileName += F(".txt");
-    if (SPIFFS.exists(fileName))
+    if(activeRuleSets[x])
       rulesProcessingFile(fileName, event);
   }
 
@@ -1937,6 +1954,11 @@ void rulesProcessing(String& event)
 String rulesProcessingFile(String fileName, String& event)
 {
   checkRAM(F("rulesProcessingFile"));
+  if (Settings.SerialLogLevel == LOG_LEVEL_DEBUG_DEV){
+    Serial.print(F("RuleDebug Processing:"));
+    Serial.println(fileName);
+    Serial.println(F("     flags CMI  parse output:"));
+    }
   fs::File f = SPIFFS.open(fileName, "r+");
   SPIFFS_CHECK(f, fileName.c_str());
 
@@ -1950,11 +1972,9 @@ String rulesProcessingFile(String fileName, String& event)
     log = F("EVENT: Error: Nesting level exceeded!");
     addLog(LOG_LEVEL_ERROR, log);
     nestingLevel--;
-    return(log);
+    return (log);
   }
 
-
-  // int pos = 0;
   String line = "";
   boolean match = false;
   boolean codeBlock = false;
@@ -1963,148 +1983,167 @@ String rulesProcessingFile(String fileName, String& event)
   boolean condition = false;
   boolean ifBranche = false;
 
+  byte buf[RULES_BUFFER_SIZE];
+  int len = 0;
   while (f.available())
   {
-    data = f.read();
+    len = f.read((byte*)buf, RULES_BUFFER_SIZE);
+    for (int x = 0; x < len; x++) {
+      data = buf[x];
 
-    SPIFFS_CHECK(data >= 0, fileName.c_str());
+      SPIFFS_CHECK(data >= 0, fileName.c_str());
 
-    if (data != 10)
-      line += char(data);
+      if (data != 10)
+        line += char(data);
 
-    if (data == 10)    // if line complete, parse this rule
-    {
-      line.replace("\r", "");
-      if (line.substring(0, 2) != "//" && line.length() > 0)
+      if (data == 10)    // if line complete, parse this rule
       {
-        isCommand = true;
-
-        int comment = line.indexOf("//");
-        if (comment > 0)
-          line = line.substring(0, comment);
-
-        line = parseTemplate(line, line.length());
-        line.trim();
-
-        String lineOrg = line; // store original line for future use
-        line.toLowerCase(); // convert all to lower case to make checks easier
-
-        String eventTrigger = "";
-        String action = "";
-
-        if (!codeBlock)  // do not check "on" rules if a block of actions is to be processed
+        line.replace("\r", "");
+        if (line.substring(0, 2) != "//" && line.length() > 0)
         {
-          if (line.startsWith("on "))
+          isCommand = true;
+
+          int comment = line.indexOf("//");
+          if (comment > 0)
+            line = line.substring(0, comment);
+
+          if (match || !codeBlock) {
+            // only parse [xxx#yyy] if we have a matching ruleblock or need to eval the "on" (no codeBlock)
+            // This to avoid waisting CPU time...
+            line = parseTemplate(line, line.length());
+          }
+          line.trim();
+          
+          String lineOrg = line; // store original line for future use
+          line.toLowerCase(); // convert all to lower case to make checks easier
+
+
+          String eventTrigger = "";
+          String action = "";
+
+          if (!codeBlock)  // do not check "on" rules if a block of actions is to be processed
           {
-            line = line.substring(3);
-            int split = line.indexOf(" do");
+            if (line.startsWith("on "))
+            {
+              line = line.substring(3);
+              int split = line.indexOf(" do");
+              if (split != -1)
+              {
+                eventTrigger = line.substring(0, split);
+                action = lineOrg.substring(split + 7);
+                action.trim();
+              }
+              if (eventTrigger == "*") // wildcard, always process
+                match = true;
+              else
+                match = ruleMatch(event, eventTrigger);
+              if (action.length() > 0) // single on/do/action line, no block
+              {
+                isCommand = true;
+                codeBlock = false;
+              }
+              else
+              {
+                isCommand = false;
+                codeBlock = true;
+              }
+            }
+          }
+          else
+          {
+            action = lineOrg;
+          }
+
+          String lcAction = action;
+          lcAction.toLowerCase();
+          if (lcAction == "endon") // Check if action block has ended, then we will wait for a new "on" rule
+          {
+            isCommand = false;
+            codeBlock = false;
+            match = false;            
+          }
+          
+          if (Settings.SerialLogLevel == LOG_LEVEL_DEBUG_DEV){
+            Serial.print(F("RuleDebug: "));
+            Serial.print(codeBlock);
+            Serial.print(match);
+            Serial.print(isCommand);
+            Serial.print(": ");
+            Serial.println(line);
+          }
+          
+          if (match) // rule matched for one action or a block of actions
+          {
+            int split = lcAction.indexOf("if "); // check for optional "if" condition
             if (split != -1)
             {
-              eventTrigger = line.substring(0, split);
-              action = lineOrg.substring(split + 7);
-              action.trim();
-            }
-            if (eventTrigger == "*") // wildcard, always process
-              match = true;
-            else
-              match = ruleMatch(event, eventTrigger);
-            if (action.length() > 0) // single on/do/action line, no block
-            {
-              isCommand = true;
-              codeBlock = false;
-            }
-            else
-            {
+              conditional = true;
+              String check = lcAction.substring(split + 3);
+              condition = conditionMatchExtended(check);
+              ifBranche = true;
               isCommand = false;
-              codeBlock = true;
             }
-          }
-        }
-        else
-        {
-          action = lineOrg;
-        }
 
-        String lcAction = action;
-        lcAction.toLowerCase();
-        if (lcAction == "endon") // Check if action block has ended, then we will wait for a new "on" rule
-        {
-          isCommand = false;
-          codeBlock = false;
-        }
-
-        if (match) // rule matched for one action or a block of actions
-        {
-          int split = lcAction.indexOf("if "); // check for optional "if" condition
-          if (split != -1)
-          {
-            conditional = true;
-            String check = lcAction.substring(split + 3);
-            condition = conditionMatchExtended(check);
-            ifBranche = true;
-            isCommand = false;
-          }
-
-          if (lcAction == "else") // in case of an "else" block of actions, set ifBranche to false
-          {
-            ifBranche = false;
-            isCommand = false;
-          }
-
-          if (lcAction == "endif") // conditional block ends here
-          {
-            conditional = false;
-            isCommand = false;
-          }
-
-          // process the action if it's a command and unconditional, or conditional and the condition matches the if or else block.
-          if (isCommand && ((!conditional) || (conditional && (condition == ifBranche))))
-          {
-            if (event.charAt(0) == '!')
+            if (lcAction == "else") // in case of an "else" block of actions, set ifBranche to false
             {
-              action.replace(F("%eventvalue%"), event); // substitute %eventvalue% with literal event string if starting with '!'
+              ifBranche = false;
+              isCommand = false;
             }
-            else
+
+            if (lcAction == "endif") // conditional block ends here
             {
-              int equalsPos = event.indexOf("=");
-              if (equalsPos > 0)
+              conditional = false;
+              isCommand = false;
+            }
+
+            // process the action if it's a command and unconditional, or conditional and the condition matches the if or else block.
+            if (isCommand && ((!conditional) || (conditional && (condition == ifBranche))))
+            {
+              if (event.charAt(0) == '!')
               {
-                String tmpString = event.substring(equalsPos + 1);
-                action.replace(F("%eventvalue%"), tmpString); // substitute %eventvalue% in actions with the actual value from the event
+                action.replace(F("%eventvalue%"), event); // substitute %eventvalue% with literal event string if starting with '!'
               }
-            }
-            log = F("ACT  : ");
-            log += action;
-            addLog(LOG_LEVEL_INFO, log);
+              else
+              {
+                int equalsPos = event.indexOf("=");
+                if (equalsPos > 0)
+                {
+                  String tmpString = event.substring(equalsPos + 1);
+                  action.replace(F("%eventvalue%"), tmpString); // substitute %eventvalue% in actions with the actual value from the event
+                }
+              }
+              log = F("ACT  : ");
+              log += action;
+              addLog(LOG_LEVEL_INFO, log);
 
-            struct EventStruct TempEvent;
-            parseCommandString(&TempEvent, action);
-            yield();
-            // Use a tmp string to call PLUGIN_WRITE, since PluginCall may inadvertenly alter the string.
-            String tmpAction(action);
-            if (!PluginCall(PLUGIN_WRITE, &TempEvent, tmpAction)) {
-              if (!tmpAction.equals(action)) {
-                String log = F("PLUGIN_WRITE altered the string: ");
-                log += action;
-                log += F(" to: ");
-                log += tmpAction;
-                addLog(LOG_LEVEL_ERROR, log);
+              struct EventStruct TempEvent;
+              parseCommandString(&TempEvent, action);
+              yield();
+              // Use a tmp string to call PLUGIN_WRITE, since PluginCall may inadvertenly alter the string.
+              String tmpAction(action);
+              if (!PluginCall(PLUGIN_WRITE, &TempEvent, tmpAction)) {
+                if (!tmpAction.equals(action)) {
+                  String log = F("PLUGIN_WRITE altered the string: ");
+                  log += action;
+                  log += F(" to: ");
+                  log += tmpAction;
+                  addLog(LOG_LEVEL_ERROR, log);
+                }
+                ExecuteCommand(VALUE_SOURCE_SYSTEM, action.c_str());
               }
-              ExecuteCommand(VALUE_SOURCE_SYSTEM, action.c_str());
+              yield();
             }
-            yield();
           }
         }
-      }
 
-      line = "";
+        line = "";
+      }
     }
-    //pos++;
   }
 
   nestingLevel--;
   checkRAM(F("rulesProcessingFile2"));
-  return(String());
+  return (String());
 }
 
 
@@ -2482,7 +2521,7 @@ class RamTracker{
         writePtr=0;
         for (int i = 0; i< TRACES; i++) {
           traces[i]="";
-          tracesMemory[i]=0xffff;                           // init with best case memory values, so they get replaced if memory goes lower
+          tracesMemory[i]=0xffffffff;                           // init with best case memory values, so they get replaced if memory goes lower
           }
         for (int i = 0; i< TRACEENTRIES; i++) {
           nextAction[i]="startup";
@@ -2591,7 +2630,7 @@ void play_rtttl(uint8_t _pin, const char *p )
   #define OCTAVE_OFFSET 0
   // FIXME: Absolutely no error checking in here
 
-  int notes[] = { 0,
+  const int notes[] = { 0,
     262, 277, 294, 311, 330, 349, 370, 392, 415, 440, 466, 494,
     523, 554, 587, 622, 659, 698, 740, 784, 831, 880, 932, 988,
     1047, 1109, 1175, 1245, 1319, 1397, 1480, 1568, 1661, 1760, 1865, 1976,

@@ -390,16 +390,40 @@ String getDateString()
 
 // returns the current Time separated by the given delimiter
 // time format example with ':' delimiter: 23:59:59 (HH:MM:SS)
-String getTimeString(const timeStruct& ts, char delimiter)
+String getTimeString(const timeStruct& ts, char delimiter, bool am_pm, bool show_seconds)
 {
   char TimeString[20]; //19 digits plus the null char
-  sprintf_P(TimeString, PSTR("%02d%c%02d%c%02d"), ts.Hour, delimiter, ts.Minute, delimiter, ts.Second);
+  if (am_pm) {
+    uint8_t hour(ts.Hour % 12);
+    if (hour == 0) { hour = 12; }
+    const char a_or_p = ts.Hour < 12 ? 'A' : 'P';
+    if (show_seconds) {
+      sprintf_P(TimeString, PSTR("%d%c%02d%c%02d %cM"),
+        hour, delimiter, ts.Minute, delimiter, ts.Second, a_or_p);
+    } else {
+      sprintf_P(TimeString, PSTR("%d%c%02d %cM"),
+        hour, delimiter, ts.Minute, a_or_p);
+    }
+  } else {
+    if (show_seconds) {
+      sprintf_P(TimeString, PSTR("%02d%c%02d%c%02d"),
+        ts.Hour, delimiter, ts.Minute, delimiter, ts.Second);
+    } else {
+      sprintf_P(TimeString, PSTR("%d%c%02d"),
+        ts.Hour, delimiter, ts.Minute);
+    }
+  }
   return TimeString;
 }
 
-String getTimeString(char delimiter)
+String getTimeString(char delimiter, bool show_seconds /*=true*/)
 {
-  return getTimeString(tm, delimiter);
+  return getTimeString(tm, delimiter, false, show_seconds);
+}
+
+String getTimeString_ampm(char delimiter, bool show_seconds /*=true*/)
+{
+  return getTimeString(tm, delimiter, true, show_seconds);
 }
 
 // returns the current Time without delimiter
@@ -409,20 +433,29 @@ String getTimeString()
 	return getTimeString('\0');
 }
 
+String getTimeString_ampm()
+{
+	return getTimeString_ampm('\0');
+}
+
 // returns the current Date and Time separated by the given delimiter
 // if called like this: getDateTimeString('\0', '\0', '\0');
 // it will give back this: 20161231235959  (YYYYMMDDHHMMSS)
-String getDateTimeString(const timeStruct& ts, char dateDelimiter, char timeDelimiter,  char dateTimeDelimiter)
+String getDateTimeString(const timeStruct& ts, char dateDelimiter, char timeDelimiter,  char dateTimeDelimiter, bool am_pm)
 {
 	String ret = getDateString(ts, dateDelimiter);
 	if (dateTimeDelimiter != '\0')
 		ret += dateTimeDelimiter;
-	ret += getTimeString(ts, timeDelimiter);
+	ret += getTimeString(ts, timeDelimiter, am_pm, true);
 	return ret;
 }
 
 String getDateTimeString(char dateDelimiter, char timeDelimiter,  char dateTimeDelimiter) {
-  return getDateTimeString(tm, dateDelimiter, timeDelimiter, dateTimeDelimiter);
+  return getDateTimeString(tm, dateDelimiter, timeDelimiter, dateTimeDelimiter, false);
+}
+
+String getDateTimeString_ampm(char dateDelimiter, char timeDelimiter,  char dateTimeDelimiter) {
+  return getDateTimeString(tm, dateDelimiter, timeDelimiter, dateTimeDelimiter, true);
 }
 
 /********************************************************************************************\
